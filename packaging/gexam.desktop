@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=GExam Server
+Comment=Start and stop the GExam LAN exam server
+Exec=gexam-panel
+Icon=gexam
+Terminal=false
+StartupNotify=true
+Categories=Education;
+Keywords=exam;gate;server;

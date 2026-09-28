@@ -1,0 +1,350 @@
+#!/usr/bin/python3
+"""GExam Server control panel: start / stop / restart the LAN exam server and see its status."""
+import json
+import os
+import subprocess
+import sys
+import threading
+import urllib.request
+
+import gi
+
+gi.require_version("Gtk", "3.0")
+gi.require_version("Gdk", "3.0")
+from gi.repository import Gdk, GLib, Gtk  # noqa: E402
+
+# Overridable so the panel can be tested against a throwaway user service.
+UNIT = os.environ.get("GEXAM_UNIT", "gexam.service")
+USER_MODE = os.environ.get("GEXAM_USER_UNIT") == "1"
+ENV_FILE = os.environ.get("GEXAM_ENV_FILE", "/etc/gexam/gexam.env")
+LOG_FILE = os.environ.get("GEXAM_LOG_FILE", "/var/log/gexam.log")
+
+CSS = b"""
+.dot { font-size: 22px; }
+.dot-on { color: #16a34a; }
+.dot-off { color: #9ca3af; }
+.dot-busy { color: #d97706; }
+.dot-bad { color: #dc2626; }
+.status-title { font-size: 20px; font-weight: 700; }
+.muted { opacity: 0.7; }
+.addr { font-family: monospace; }
+"""
+
+
+def systemctl(*args):
+    cmd = ["systemctl"] + (["--user"] if USER_MODE else []) + list(args)
+    return subprocess.run(cmd, capture_output=True, text=True)
+
+
+def read_port():
+    try:
+        with open(ENV_FILE) as f:
+            for line in f:
+                if line.strip().startswith("PORT="):
+                    return int(line.split("=", 1)[1].strip())
+    except (OSError, ValueError):
+        pass
+    return int(os.environ.get("GEXAM_PORT", "3000"))
+
+
+def lan_ip():
+    try:
+        out = subprocess.run(["hostname", "-I"], capture_output=True, text=True).stdout.split()
+        return out[0] if out else "localhost"
+    except OSError:
+        return "localhost"
+
+
+def responding(port):
+    try:
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/api/status", timeout=1) as r:
+            return json.load(r).get("status") == "online"
+    except Exception:
+        return False
+
+
+def tail(path, lines=80):
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            f.seek(max(0, size - 16384))
+            data = f.read().decode("utf-8", "replace")
+        return "\n".join(data.splitlines()[-lines:])
+    except OSError:
+        return "(no log available yet)"
+
+
+class Panel(Gtk.Window):
+    def __init__(self):
+        super().__init__(title="GExam Server")
+        self.set_default_size(460, -1)
+        self.set_resizable(False)
+        self.busy = False
+        self.updating_switch = False
+        self.state = "unknown"
+
+        prov = Gtk.CssProvider()
+        prov.load_from_data(CSS)
+        Gtk.StyleContext.add_provider_for_screen(
+            self.get_screen(), prov, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION
+        )
+
+        header = Gtk.HeaderBar(title="GExam Server", show_close_button=True)
+        menu_btn = Gtk.MenuButton()
+        menu_btn.add(Gtk.Image.new_from_icon_name("open-menu-symbolic", Gtk.IconSize.BUTTON))
+        pop = Gtk.PopoverMenu()
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, margin=8)
+        reset = Gtk.ModelButton(text="Reset admin password…")
+        reset.connect("clicked", self.on_reset_admin)
+        box.pack_start(reset, False, False, 0)
+        box.show_all()
+        pop.add(box)
+        menu_btn.set_popover(pop)
+        header.pack_end(menu_btn)
+        self.set_titlebar(header)
+
+        root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=14, margin=20)
+        self.add(root)
+
+        # status
+        row = Gtk.Box(spacing=10)
+        self.dot = Gtk.Label(label="●")
+        self.dot.get_style_context().add_class("dot")
+        self.title_lbl = Gtk.Label(xalign=0)
+        self.title_lbl.get_style_context().add_class("status-title")
+        row.pack_start(self.dot, False, False, 0)
+        row.pack_start(self.title_lbl, True, True, 0)
+        root.pack_start(row, False, False, 0)
+        self.sub_lbl = Gtk.Label(xalign=0, wrap=True)
+        self.sub_lbl.get_style_context().add_class("muted")
+        root.pack_start(self.sub_lbl, False, False, 0)
+
+        # buttons
+        btns = Gtk.Box(spacing=8, homogeneous=True)
+        self.toggle_btn = Gtk.Button(label="Start server")
+        self.toggle_btn.connect("clicked", self.on_toggle)
+        self.restart_btn = Gtk.Button(label="Restart")
+        self.restart_btn.connect("clicked", self.on_restart)
+        btns.pack_start(self.toggle_btn, True, True, 0)
+        btns.pack_start(self.restart_btn, True, True, 0)
+        root.pack_start(btns, False, False, 0)
+
+        root.pack_start(Gtk.Separator(), False, False, 0)
+
+        # address
+        root.pack_start(self._caption("Admin console (this computer)"), False, False, 0)
+        arow = Gtk.Box(spacing=6)
+        self.admin_entry = Gtk.Entry(editable=False, hexpand=True)
+        self.admin_entry.get_style_context().add_class("addr")
+        copy_admin = Gtk.Button.new_from_icon_name("edit-copy-symbolic", Gtk.IconSize.BUTTON)
+        copy_admin.set_tooltip_text("Copy address")
+        copy_admin.connect("clicked", lambda *_: self.copy(self.admin_entry.get_text()))
+        self.open_btn = Gtk.Button(label="Open")
+        self.open_btn.connect("clicked", self.on_open_admin)
+        arow.pack_start(self.admin_entry, True, True, 0)
+        arow.pack_start(copy_admin, False, False, 0)
+        arow.pack_start(self.open_btn, False, False, 0)
+        root.pack_start(arow, False, False, 0)
+
+        root.pack_start(self._caption("Students open this on their lab PCs"), False, False, 0)
+        srow = Gtk.Box(spacing=6)
+        self.student_entry = Gtk.Entry(editable=False, hexpand=True)
+        self.student_entry.get_style_context().add_class("addr")
+        copy_student = Gtk.Button.new_from_icon_name("edit-copy-symbolic", Gtk.IconSize.BUTTON)
+        copy_student.set_tooltip_text("Copy address")
+        copy_student.connect("clicked", lambda *_: self.copy(self.student_entry.get_text()))
+        srow.pack_start(self.student_entry, True, True, 0)
+        srow.pack_start(copy_student, False, False, 0)
+        root.pack_start(srow, False, False, 0)
+
+        root.pack_start(Gtk.Separator(), False, False, 0)
+
+        # autostart
+        arow2 = Gtk.Box(spacing=10)
+        lbl = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        lbl.pack_start(Gtk.Label(label="Start automatically at boot", xalign=0), False, False, 0)
+        hint = Gtk.Label(label="Closing this window does not stop the server.", xalign=0)
+        hint.get_style_context().add_class("muted")
+        lbl.pack_start(hint, False, False, 0)
+        self.auto_switch = Gtk.Switch(valign=Gtk.Align.CENTER)
+        self.auto_switch.connect("notify::active", self.on_autostart)
+        arow2.pack_start(lbl, True, True, 0)
+        arow2.pack_start(self.auto_switch, False, False, 0)
+        root.pack_start(arow2, False, False, 0)
+
+        # logs
+        self.log_exp = Gtk.Expander(label="Server log")
+        sw = Gtk.ScrolledWindow(min_content_height=180, shadow_type=Gtk.ShadowType.IN)
+        self.log_view = Gtk.TextView(editable=False, monospace=True, cursor_visible=False)
+        self.log_view.set_wrap_mode(Gtk.WrapMode.WORD_CHAR)
+        sw.add(self.log_view)
+        self.log_exp.add(sw)
+        root.pack_start(self.log_exp, False, False, 0)
+
+        self.connect("destroy", Gtk.main_quit)
+        self.refresh()
+        GLib.timeout_add_seconds(2, self.refresh)
+        GLib.timeout_add_seconds(3, self.refresh_log)
+
+    def _caption(self, text):
+        lbl = Gtk.Label(label=text, xalign=0)
+        lbl.get_style_context().add_class("muted")
+        return lbl
+
+    def copy(self, text):
+        Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD).set_text(text, -1)
+
+    # ---- polling -------------------------------------------------------
+    def refresh(self):
+        threading.Thread(target=self._poll, daemon=True).start()
+        return True
+
+    def _poll(self):
+        active = systemctl("is-active", UNIT).stdout.strip()
+        enabled = systemctl("is-enabled", UNIT).stdout.strip()
+        loaded = systemctl("show", UNIT, "-p", "LoadState", "--value").stdout.strip()
+        port = read_port()
+        ok = active == "active" and responding(port)
+        GLib.idle_add(self._apply, active, enabled, loaded, port, ok)
+
+    def _apply(self, active, enabled, loaded, port, ok):
+        if loaded == "not-found":
+            state, dot, title, sub = "missing", "dot-bad", "Not installed", "The GExam service is missing. Reinstall the gexam package."
+        elif active == "active" and ok:
+            state, dot, title, sub = "running", "dot-on", "Server is running", "Ready for students on your network."
+        elif active in ("active", "activating", "reloading"):
+            state, dot, title, sub = "starting", "dot-busy", "Starting…", "Waiting for the server to answer."
+        elif active == "failed":
+            state, dot, title, sub = "failed", "dot-bad", "Server failed", "Open the server log below to see why."
+        else:
+            state, dot, title, sub = "stopped", "dot-off", "Server is stopped", "Students cannot connect until you start it."
+        self.state = state
+
+        ctx = self.dot.get_style_context()
+        for c in ("dot-on", "dot-off", "dot-busy", "dot-bad"):
+            ctx.remove_class(c)
+        ctx.add_class(dot)
+        self.title_lbl.set_text(title)
+        self.sub_lbl.set_text(sub)
+
+        running = state in ("running", "starting")
+        if not self.busy:
+            self.toggle_btn.set_label("Stop server" if running else "Start server")
+            sc = self.toggle_btn.get_style_context()
+            sc.remove_class("suggested-action")
+            sc.remove_class("destructive-action")
+            sc.add_class("destructive-action" if running else "suggested-action")
+            self.toggle_btn.set_sensitive(state != "missing")
+            self.restart_btn.set_sensitive(running)
+        self.open_btn.set_sensitive(state == "running")
+
+        ip = lan_ip()
+        self.admin_entry.set_text(f"http://localhost:{port}/admin")
+        self.student_entry.set_text(f"http://{ip}:{port}")
+
+        self.updating_switch = True
+        self.auto_switch.set_active(enabled == "enabled")
+        self.updating_switch = False
+        self.auto_switch.set_sensitive(state != "missing")
+        return False
+
+    def refresh_log(self):
+        if self.log_exp.get_expanded():
+            text = tail(LOG_FILE)
+            buf = self.log_view.get_buffer()
+            if buf.get_text(buf.get_start_iter(), buf.get_end_iter(), False) != text:
+                buf.set_text(text)
+                GLib.idle_add(lambda: self.log_view.scroll_to_iter(buf.get_end_iter(), 0, False, 0, 0))
+        return True
+
+    # ---- actions -------------------------------------------------------
+    def run_action(self, label, *args):
+        if self.busy:
+            return
+        self.busy = True
+        self.toggle_btn.set_sensitive(False)
+        self.restart_btn.set_sensitive(False)
+        self.toggle_btn.set_label(label)
+
+        def work():
+            res = systemctl(*args)
+            GLib.idle_add(self._action_done, res)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _action_done(self, res):
+        self.busy = False
+        if res.returncode != 0:
+            self.error("Could not complete the action", (res.stderr or res.stdout).strip() or "Authorization was cancelled.")
+        self.refresh()
+        return False
+
+    def on_toggle(self, _btn):
+        if self.state in ("running", "starting"):
+            self.run_action("Stopping…", "stop", UNIT)
+        else:
+            self.run_action("Starting…", "start", UNIT)
+
+    def on_restart(self, _btn):
+        self.run_action("Restarting…", "restart", UNIT)
+
+    def on_autostart(self, sw, _p):
+        if self.updating_switch:
+            return
+        want = sw.get_active()
+
+        def work():
+            res = systemctl("enable" if want else "disable", UNIT)
+            GLib.idle_add(lambda: (self.error("Could not change autostart", res.stderr.strip()) if res.returncode else None, self.refresh())[1])
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def on_open_admin(self, _btn):
+        subprocess.Popen(["xdg-open", self.admin_entry.get_text()])
+
+    def on_reset_admin(self, _btn):
+        dlg = Gtk.MessageDialog(transient_for=self, modal=True, message_type=Gtk.MessageType.WARNING,
+                                buttons=Gtk.ButtonsType.CANCEL, text="Reset the admin password?")
+        dlg.format_secondary_text(
+            "This removes the admin account so you can create a new one the next time you open the admin console. "
+            "Exams, students and results are kept."
+        )
+        dlg.add_button("Reset", Gtk.ResponseType.OK)
+        resp = dlg.run()
+        dlg.destroy()
+        if resp != Gtk.ResponseType.OK:
+            return
+
+        def work():
+            res = subprocess.run(["pkexec", "/usr/bin/gexam-reset-admin"], capture_output=True, text=True)
+            GLib.idle_add(lambda: (self.error("Reset failed", res.stderr.strip()) if res.returncode else self.info("Admin account removed", "Open the admin console to create a new admin."), self.refresh())[1])
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def error(self, title, detail):
+        d = Gtk.MessageDialog(transient_for=self, modal=True, message_type=Gtk.MessageType.ERROR,
+                              buttons=Gtk.ButtonsType.CLOSE, text=title)
+        d.format_secondary_text(detail or "Unknown error.")
+        d.run()
+        d.destroy()
+
+    def info(self, title, detail):
+        d = Gtk.MessageDialog(transient_for=self, modal=True, message_type=Gtk.MessageType.INFO,
+                              buttons=Gtk.ButtonsType.CLOSE, text=title)
+        d.format_secondary_text(detail)
+        d.run()
+        d.destroy()
+
+
+def main():
+    if "--check" in sys.argv:  # used by the package build: proves the GTK imports resolve
+        print("gexam-panel imports ok")
+        return
+    win = Panel()
+    win.show_all()
+    Gtk.main()
+
+
+if __name__ == "__main__":
+    main()
